@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class SimpleConnector(KVConnectorBase):
+class DynamoConnector(KVConnectorBase):
 
     def __init__(
         self,
@@ -40,39 +40,26 @@ class SimpleConnector(KVConnectorBase):
 
         self.config = config.kv_transfer_config
         self.tp_size = config.parallel_config.tensor_parallel_size
+        self.rank = rank
 
-        if self.config.kv_connector == "PyNcclConnector":
-            from vllm.distributed.kv_transfer.kv_pipe.pynccl_pipe import (
-                PyNcclPipe)
-            logger.info(
-                "Initializing PyNcclConfig under kv_transfer_config %s",
-                self.config)
-        elif self.config.kv_connector == "MooncakeConnector":
-            # Check if MOONCAKE_CONFIG_PATH is set
-            import os
-            use_mooncake_distributed_pipe = os.getenv(
-                'MOONCAKE_CONFIG_PATH') is not None
+        if self.config.kv_connector != "DynamoNcclConnector":
+            raise NotImplementedError("Only DynamoNcclConnector is supported by the DynamoConnector class")
 
-            if not use_mooncake_distributed_pipe:
-                raise ValueError(
-                    "To use MooncakeConnector, you need to pass the ENV: "
-                    "'MOONCAKE_CONFIG_PATH=/path/to/mooncake_config.json'.")
-            else:
-                from vllm.distributed.kv_transfer.kv_pipe.mooncake_pipe import (  # noqa: E501
-                    MooncakePipe)
-                logger.info(
-                    "Initializing MooncakeConfig under kv_transfer_config %s",
-                    self.config)
+        from vllm.distributed.kv_transfer.kv_pipe.pynccl_pipe import (
+            PyNcclPipe)
+        from vllm.distributed.kv_transfer.kv_pipe.dynamo_nccl_pipe import (
+            DynamoNcclDataPlane)
+        
+        logger.info(
+            "Initializing DynamoNcclConnector under kv_transfer_config %s",
+            self.config)
 
         self.lookup_buffer_size = self.config.kv_buffer_size
 
-        self.producer_buffer: Optional[SimpleBuffer] = None
-        self.consumer_buffer: Optional[SimpleBuffer] = None
-
-        self.producer_data_pipe: Union[PyNcclPipe, MooncakePipe]
-        self.consumer_data_pipe: Union[PyNcclPipe, MooncakePipe]
-        self.producer_signal_pipe: Union[PyNcclPipe, MooncakePipe]
-        self.consumer_signal_pipe: Union[PyNcclPipe, MooncakePipe]
+        self.producer_data_pipe: PyNcclPipe
+        self.consumer_data_pipe: PyNcclPipe
+        self.producer_signal_pipe: PyNcclPipe
+        self.consumer_signal_pipe: PyNcclPipe
 
         self._broadcast_and_enhance_kv_config(rank, config, world_group)
 
@@ -81,91 +68,25 @@ class SimpleConnector(KVConnectorBase):
 
         # 2 pipes for every rank in the world
         if self.config.is_kv_producer:
-            port_offset_base = 2 * rank + 1
+            port_offset_base = rank + 1
         else:
-            port_offset_base = 2 * (rank // self.config.tensor_parallel_multiplier) + 1
+            port_offset_base = rank // self.config.tensor_parallel_multiplier + 1
+
 
         self.local_kv_rank = rank % self.config.tensor_parallel_multiplier
-        # In disaggregated prefill, the prefill vLLM only uses send pipe
-        # and the decode vLLM only uses recv pipe
-        if self.config.is_kv_producer:
+        self.global_kv_rank = self._get_global_kv_rank(self.config.kv_rank, rank, self.config)
 
-            if self.config.kv_connector == "PyNcclConnector":
-                self.producer_data_pipe = PyNcclPipe(
-                    kv_group_rank=self.kv_group_rank,
-                    local_rank=local_rank,
-                    config=self.config,
-                    port_offset=port_offset_base,
-                )
-                self.producer_signal_pipe = PyNcclPipe(
-                    kv_group_rank=self.kv_group_rank,
-                    local_rank=local_rank,
-                    config=self.config,
-                    port_offset=port_offset_base + 1,
-                    device="cpu",
-                )
-            elif self.config.kv_connector == "MooncakeConnector":
-                self.producer_data_pipe = MooncakePipe(
-                    local_rank=local_rank,
-                    config=self.config,
-                )
-                # We only need to initialize MooncakePipe once
-                self.producer_signal_pipe = self.producer_data_pipe
+        self.data_pipe = PyNcclPipe(
+            kv_group_rank=self.kv_group_rank,
+            local_rank=local_rank,
+            config=self.config,
+            port_offset=port_offset_base,
+        )
 
-            self.producer_buffer = SimpleBuffer(self.producer_signal_pipe,
-                                                self.producer_data_pipe,
-                                                self.config.kv_buffer_size)
-
-        else:
-
-            # the current vLLM instance is KV consumer, so it needs to connect
-            # its recv pipe to the send pipe of KV producder
-            if self.config.kv_connector == "PyNcclConnector":
-                self.consumer_data_pipe = PyNcclPipe(
-                    kv_group_rank=self.kv_group_rank,
-                    local_rank=local_rank,
-                    config=self.config,
-                    port_offset=port_offset_base,
-                )
-                self.consumer_signal_pipe = PyNcclPipe(
-                    kv_group_rank=self.kv_group_rank,
-                    local_rank=local_rank,
-                    config=self.config,
-                    port_offset=port_offset_base + 1,
-                    device="cpu",
-                )
-            elif self.config.kv_connector == "MooncakeConnector":
-                self.consumer_data_pipe = MooncakePipe(
-                    local_rank=local_rank,
-                    config=self.config,
-                )
-                self.consumer_signal_pipe = self.consumer_data_pipe
-
-            self.consumer_buffer = SimpleBuffer(
-                self.consumer_signal_pipe,
-                self.consumer_data_pipe,
-                self.config.kv_buffer_size,
-            )
-
-    def select(self, source_rank: int, input_tokens: Optional[torch.Tensor],
-               roi: Optional[torch.Tensor]) -> List[Optional[torch.Tensor]]:
-
-        logger.info("Selecting KV caches and hidden states for source rank %d", source_rank)
-
-        assert self.consumer_buffer is not None, "Please initialize the "\
-            "consumer buffer before calling select."
-        return self.consumer_buffer.drop_select(source_rank, self.local_kv_rank, input_tokens, roi)
-
-    def insert(self, kv_group_rank: int, target_rank: int, input_tokens: torch.Tensor, roi: torch.Tensor,
-               key: torch.Tensor, value: torch.Tensor,
-               hidden: torch.Tensor) -> None:
-
-        logger.info("Inserting KV caches and hidden states for kv_group_rank %d, target rank %d", kv_group_rank, target_rank)
-
-        assert self.producer_buffer is not None, "Please initialize the "\
-            "producer buffer before calling insert."
-
-        self.producer_buffer.insert(kv_group_rank, target_rank, input_tokens, roi, key, value, hidden)
+        self.data_plane = DynamoNcclDataPlane(
+            data_pipe=self.data_pipe,
+            port=self._get_data_plane_port(self.global_kv_rank),
+        )
 
     def send_kv_caches_and_hidden_states(
         self,
@@ -204,8 +125,8 @@ class SimpleConnector(KVConnectorBase):
             end_pos = start_pos + slen
             current_tokens = input_tokens_tensor[start_pos:end_pos]
             current_request_id = request_ids[idx]
-            _, decode_kv_rank = self.parse_request_id(current_request_id)
-            starting_kv_group_rank = self._get_kv_group_rank(decode_kv_rank, 0, self.config)
+            decode_hostname, decode_kv_rank = self.parse_request_id(current_request_id)
+            decode_first_global_rank = self._get_global_kv_rank(decode_kv_rank, self.rank * self.config.tensor_parallel_multiplier, self.config)
 
             for target_rank in range(self.config.tensor_parallel_multiplier):
 
@@ -233,10 +154,11 @@ class SimpleConnector(KVConnectorBase):
                 keys = torch.cat(keys, dim=0)
                 values = torch.cat(values, dim=0)
 
-                self.insert(starting_kv_group_rank, target_rank, current_tokens,
-                            torch.ones_like(current_tokens,
-                                            dtype=bool), keys, values,
-                            hidden_or_intermediate_states[start_pos:end_pos])
+                decode_global_rank = decode_first_global_rank + target_rank
+                decode_port = self._get_data_plane_port(decode_global_rank)
+                partial_hidden_or_intermediate_states = hidden_or_intermediate_states[start_pos:end_pos]
+                self._send(decode_hostname, decode_port, current_request_id, keys, values,
+                            partial_hidden_or_intermediate_states)
 
         logger.debug("[rank%d]: KV send DONE.", torch.distributed.get_rank())
 
@@ -261,7 +183,6 @@ class SimpleConnector(KVConnectorBase):
         hidden_or_intermediate_states_for_one_req = []
 
         input_tokens_list = []
-        num_computed_tokens_list = []
         start_pos_list = []
 
         model_config = model_executable.model.config
@@ -275,37 +196,16 @@ class SimpleConnector(KVConnectorBase):
             end_pos = start_pos + slen
             current_tokens = input_tokens_tensor[start_pos:end_pos]
             current_request_id = request_ids[idx]
-            prefill_rank, _ = self.parse_request_id(current_request_id)
             num_tokens = slen
 
             # collecting data for rebuilding the input
             input_tokens_list.append(current_tokens)
             start_pos_list.append(start_pos)
 
-            ret = self.select(prefill_rank, current_tokens,
-                              torch.ones_like(current_tokens, dtype=bool))
-            if ret[0] is None:
-                # didn't find any match.
-                bypass_model_exec = False
-                num_computed_tokens_list.append(0)
-                continue
-
-            roi: torch.Tensor = ret[1]
-            keys: torch.Tensor = ret[2]
-            values: torch.Tensor = ret[3]
-            hidden: torch.Tensor = ret[4]
-
-            num_computed_tokens = roi.shape[0]
-            num_computed_tokens_list.append(num_computed_tokens)
-
-            # check if both KV cache and the hidden states are received
-            # If not, need to redo the forwarding to compute missing states
-            if not all([(num_computed_tokens == num_tokens), hidden is not None
-                        ]):
-                bypass_model_exec = False
-
-            # update the end position based on how many tokens are cached.
-            end_pos = start_pos + num_computed_tokens
+            ret = self._recv(current_request_id)
+            keys: torch.Tensor = ret[0]
+            values: torch.Tensor = ret[1]
+            hidden: torch.Tensor = ret[2]
 
             # put received KV caches into paged memory
             for i in range(model_executable.model.start_layer,
@@ -356,34 +256,35 @@ class SimpleConnector(KVConnectorBase):
         return hidden_or_intermediate_states, bypass_model_exec, model_input
 
     def close(self):
-        self.producer_data_pipe.close()
-        self.consumer_data_pipe.close()
-        if self.config.kv_connector == "PyNcclConnector":
-            self.producer_signal_pipe.close()
-            self.consumer_signal_pipe.close()
-        elif self.config.kv_connector == "MooncakeConnector":
-            # MooncakePipe reuses data_pipe for signal_pipe, so we only have to
-            # close the data_pipe.
-            pass
+        self.data_pipe.close()
+        # self.data_plane.close()
 
     @staticmethod
-    def parse_request_id(request_id):
-        # Regular expression to match the ranks
-        pattern = r"___prefill_kv_rank_(\d+)___decode_kv_rank_(\d+)"
+    def parse_request_id(request_id: str) -> Tuple[str, int]:
+        # Regular expression to match the string hostname and integer decode_kv_rank
+        pattern = r"___decode_hostname_(.*)___decode_kv_rank_(\d+)"
         
         # Use re.search to find the pattern in the request_id
         match = re.search(pattern, request_id)
-        
         if match:
             # Extract the ranks
-            prefill_rank = int(match.group(1))
+            decode_hostname = match.group(1)
             decode_rank = int(match.group(2))
             
-            return prefill_rank, decode_rank
-        else:
-            return None, None
+            return decode_hostname, decode_rank
+        raise ValueError(f"Request id {request_id} does not contain hostname and decode_kv_rank")
 
-    
+    def _send(self, hostname: str, port: int, request_id: str, keys: torch.Tensor, values: torch.Tensor, hidden: torch.Tensor):
+        remote_address = f"{hostname}:{port}"
+        self.data_plane.send_tensor(keys, f"{request_id}_keys", remote_address)
+        self.data_plane.send_tensor(values, f"{request_id}_values", remote_address)
+        self.data_plane.send_tensor(hidden, f"{request_id}_hidden", remote_address)
+
+    def _recv(self, request_id: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        keys = self.data_plane.recv_tensor(f"{request_id}_keys")
+        values = self.data_plane.recv_tensor(f"{request_id}_values")
+        hidden = self.data_plane.recv_tensor(f"{request_id}_hidden")
+        return keys, values, hidden
 
     def _get_kv_group_rank(self, kv_rank: int, rank: int, config: KVTransferConfig) -> int:
         if kv_rank < config.kv_producers_parallel_size:
@@ -391,45 +292,53 @@ class SimpleConnector(KVConnectorBase):
         
         kv_consumer_rank = kv_rank - config.kv_producers_parallel_size
         return config.kv_producers_parallel_size + kv_consumer_rank * config.tensor_parallel_multiplier + rank % config.tensor_parallel_multiplier
+    
+
+    def _get_global_kv_rank(self, kv_rank: int, rank: int, config: KVTransferConfig) -> int:
+        if kv_rank <= config.kv_producers_parallel_size:
+            return kv_rank * config.kv_producers_tensor_parallel_size + rank
+        
+        kv_consumer_rank = kv_rank - config.kv_producers_parallel_size
+        return config.kv_producers_parallel_size * config.kv_producers_tensor_parallel_size + kv_consumer_rank * config.kv_consumers_tensor_parallel_size + rank
+
+
+    def _get_data_plane_port(self, global_kv_rank: int) -> int:
+        return self.config.kv_port + self.config.kv_producers_tensor_parallel_size + 1 + global_kv_rank
 
     def _broadcast_and_enhance_kv_config(self, rank: int, config: VllmConfig, world_group):
         if rank == 0:
-            if self.config.kv_connector == "PyNcclConnector":
-                config_group = StatelessProcessGroup.create(
-                    host=self.config.kv_ip,
-                    port=self.config.kv_port,
-                    rank=self.config.kv_rank,
-                    world_size=self.config.kv_parallel_size,
-                )
-                parallel_configs = config_group.all_gather_obj({
-                    "kv_role": self.config.kv_role,
-                    "tensor_parallel_size": config.parallel_config.tensor_parallel_size,
-                    "pipeline_parallel_size": config.parallel_config.pipeline_parallel_size,
-                })
-                logger.debug("parallel_configs: %s", parallel_configs)
-                kv_config_enhanced = {
-                    "kv_producers_tensor_parallel_size": None,
-                    "kv_consumers_tensor_parallel_size": None,
-                    "kv_producers_pipeline_parallel_size": None,
-                    "kv_consumers_pipeline_parallel_size": None,
-                    "kv_producers_parallel_size": 0,
-                }
-                for parallel_config in parallel_configs:
-                    kv_role = parallel_config["kv_role"]
-                    assert parallel_config["pipeline_parallel_size"] == 1, f"Only pipeline parallel size 1 is supported for kv transfer instances"
-                    
-                    if kv_role == "kv_producer":
-                        kv_config_enhanced["kv_producers_parallel_size"] += 1
-                    if kv_config_enhanced[f"{kv_role}s_tensor_parallel_size"] is None:
-                        kv_config_enhanced[f"{kv_role}s_tensor_parallel_size"] = parallel_config["tensor_parallel_size"]
-                        kv_config_enhanced[f"{kv_role}s_pipeline_parallel_size"] = parallel_config["pipeline_parallel_size"]
-                    else:
-                        assert kv_config_enhanced[f"{kv_role}s_tensor_parallel_size"] == parallel_config["tensor_parallel_size"], f"All kv {kv_role}s should have the same tensor parallel size"
-                        assert kv_config_enhanced[f"{kv_role}s_pipeline_parallel_size"] == parallel_config["pipeline_parallel_size"], f"All kv {kv_role}s should have the same pipeline parallel size"
-                world_group.broadcast_object(kv_config_enhanced)
-
-            else:
-                raise NotImplementedError("MooncakeConnector is not supported in Dynamo patch")
+            config_group = StatelessProcessGroup.create(
+                host=self.config.kv_ip,
+                port=self.config.kv_port,
+                rank=self.config.kv_rank,
+                world_size=self.config.kv_parallel_size,
+            )
+            parallel_configs = config_group.all_gather_obj({
+                "kv_role": self.config.kv_role,
+                "tensor_parallel_size": config.parallel_config.tensor_parallel_size,
+                "pipeline_parallel_size": config.parallel_config.pipeline_parallel_size,
+            })
+            logger.debug("parallel_configs: %s", parallel_configs)
+            kv_config_enhanced = {
+                "kv_producers_tensor_parallel_size": None,
+                "kv_consumers_tensor_parallel_size": None,
+                "kv_producers_pipeline_parallel_size": None,
+                "kv_consumers_pipeline_parallel_size": None,
+                "kv_producers_parallel_size": 0,
+            }
+            for parallel_config in parallel_configs:
+                kv_role = parallel_config["kv_role"]
+                assert parallel_config["pipeline_parallel_size"] == 1, f"Only pipeline parallel size 1 is supported for kv transfer instances"
+                
+                if kv_role == "kv_producer":
+                    kv_config_enhanced["kv_producers_parallel_size"] += 1
+                if kv_config_enhanced[f"{kv_role}s_tensor_parallel_size"] is None:
+                    kv_config_enhanced[f"{kv_role}s_tensor_parallel_size"] = parallel_config["tensor_parallel_size"]
+                    kv_config_enhanced[f"{kv_role}s_pipeline_parallel_size"] = parallel_config["pipeline_parallel_size"]
+                else:
+                    assert kv_config_enhanced[f"{kv_role}s_tensor_parallel_size"] == parallel_config["tensor_parallel_size"], f"All kv {kv_role}s should have the same tensor parallel size"
+                    assert kv_config_enhanced[f"{kv_role}s_pipeline_parallel_size"] == parallel_config["pipeline_parallel_size"], f"All kv {kv_role}s should have the same pipeline parallel size"
+            world_group.broadcast_object(kv_config_enhanced)
         else:
             kv_config_enhanced = world_group.broadcast_object()
         logger.info("kv_config_enhanced: %s", kv_config_enhanced)

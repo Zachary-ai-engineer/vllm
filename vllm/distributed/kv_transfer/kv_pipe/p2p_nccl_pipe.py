@@ -163,7 +163,8 @@ class P2pNcclPipe:
                 logger.debug("Received message from %s, data: %s",
                              remote_address.decode(), data)
                 if data["cmd"] == "NEW":
-                    unique_id = self.nccl.unique_id_from_bytes(bytes(data["unique_id"]))
+                    unique_id = self.nccl.unique_id_from_bytes(
+                        bytes(data["unique_id"]))
                     with torch.cuda.device(self.device):
                         rank = 1
                         comm: ncclComm_t = self.nccl.ncclCommInitRank(
@@ -194,9 +195,12 @@ class P2pNcclPipe:
                             _tensor_id, _remote_address, tensor = item
                             if tensor_id == _tensor_id:
                                 data = {
-                                    "ret": 0,
-                                    "shape": tensor.shape,
-                                    "dtype": str(tensor.dtype).replace("torch.", "")
+                                    "ret":
+                                    0,
+                                    "shape":
+                                    tensor.shape,
+                                    "dtype":
+                                    str(tensor.dtype).replace("torch.", "")
                                 }
                             else:
                                 data = {"ret": 1}

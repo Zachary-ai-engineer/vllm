@@ -20,6 +20,7 @@ from vllm.v1.core.sched.utils import check_stop
 from vllm.v1.engine import (EngineCoreEventType, EngineCoreOutput,
                             EngineCoreOutputs)
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -76,6 +77,9 @@ class Scheduler(SchedulerInterface):
         # Priority queues for requests.
         self.waiting: deque[Request] = deque()
         self.running: list[Request] = []
+        # P/D: requests transfering from P -> D (NIXL).
+        self.transfering: list[str] = []
+
         # The requests that have been scheduled and are being executed
         # by the executor.
         self.scheduled_req_ids: set[str] = set()
@@ -138,6 +142,7 @@ class Scheduler(SchedulerInterface):
         structured_output_request_ids: dict[str, int] = {}
 
         req_to_new_block_ids: dict[str, list[int]] = {}
+        req_to_staging_block_ids: dict[str, list[int]] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
         # Encoder-related.
@@ -187,9 +192,9 @@ class Scheduler(SchedulerInterface):
                 new_encoder_budget = encoder_budget
 
             while True:
-                new_blocks = self.kv_cache_manager.allocate_slots(
+                blocks = self.kv_cache_manager.allocate_slots(
                     request, num_new_tokens)
-                if new_blocks is None:
+                if blocks is None:
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
                     preempted_req = self.running.pop()
@@ -212,7 +217,11 @@ class Scheduler(SchedulerInterface):
                     break
             if not can_schedule:
                 break
-            assert new_blocks is not None
+            assert blocks is not None
+            new_blocks, staging_blocks = blocks
+            # Staging blocks should only be in the first prefill.
+            # i.e. in the WAITING -> RUNNING state transition.
+            assert len(staging_blocks) == 0
 
             # Schedule the request.
             scheduled_running_reqs.append(request)
@@ -320,12 +329,29 @@ class Scheduler(SchedulerInterface):
                     encoder_inputs_to_schedule = None
                     new_encoder_budget = encoder_budget
 
-                new_blocks = self.kv_cache_manager.allocate_slots(
-                    request, num_new_tokens, computed_blocks)
-                if new_blocks is None:
+                # P/D: PWorker allocates staging blocks for NIXL.
+                num_staging_tokens = (request.num_tokens 
+                                      if request.is_remote_prefill_worker else 0)
+
+                # Allocate slots.
+                blocks_tuple = self.kv_cache_manager.allocate_slots(
+                    request, num_new_tokens, computed_blocks, num_staging_tokens)
+                if blocks_tuple is None:
                     # The request cannot be scheduled.
                     break
+                new_blocks, staging_blocks = blocks_tuple
 
+                # P/D: PWorker tracks reqs until transfering is done.
+                if len(staging_blocks) > 0:
+                    # TODO: make sure we handle Preemption.
+                    # TODO: make sure we handle Sliding Window.
+                    assert request.status == RequestStatus.WAITING
+                    self.transfering.append(request.request_id)
+                    req_to_staging_block_ids[request.request_id] = [
+                        b.block_id for b in staging_blocks
+                    ]
+
+                # Add to running.
                 self.waiting.popleft()
                 if request.use_structured_output:
                     structured_output_request_ids[
@@ -394,9 +420,11 @@ class Scheduler(SchedulerInterface):
         )
         # Construct the scheduler output.
         new_reqs_data = [
-            NewRequestData.from_request(req,
-                                        req_to_new_block_ids[req.request_id])
-            for req in scheduled_new_reqs
+            NewRequestData.from_request(
+                request=req,
+                block_ids=req_to_new_block_ids[req.request_id],
+                staging_block_ids=req_to_staging_block_ids.get(req.request_id, None),
+            ) for req in scheduled_new_reqs
         ]
         resumed_reqs_data = [
             self._make_cached_request_data(

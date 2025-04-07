@@ -53,3 +53,8 @@ KVConnectorFactory.register_connector(
     "DynamoNcclConnector",
     "vllm.distributed.kv_transfer.kv_connector.dynamo_connector",
     "DynamoConnector")
+
+KVConnectorFactory.register_connector(
+    "LayerwisePyNcclConnector",
+    "vllm.distributed.kv_transfer.kv_connector.layerwise_connector",
+    "LayerwiseConnector")    

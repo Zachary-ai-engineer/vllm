@@ -1273,6 +1273,12 @@ class EngineArgs:
             or "all" in detailed_trace_modules,
         )
 
+        if (self.kv_transfer_config is not None and \
+                self.kv_transfer_config.is_layerwise_kv_transfer and \
+                self.kv_transfer_config.is_kv_producer and \
+                not model_config.enforce_eager):
+            raise ValueError("layerwise KV producer only supports eager mode")
+            
         config = VllmConfig(
             model_config=model_config,
             cache_config=cache_config,
@@ -1288,6 +1294,7 @@ class EngineArgs:
             compilation_config=self.compilation_config,
             kv_transfer_config=self.kv_transfer_config,
         )
+
 
         if envs.VLLM_USE_V1:
             self._override_v1_engine_config(config)

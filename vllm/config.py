@@ -2725,6 +2725,13 @@ class KVTransferConfig(BaseModel):
             self.kv_role in ["kv_consumer", "kv_both"]
 
     @property
+    def is_layerwise_kv_transfer(self) -> bool:
+        # so far, only LayerwisePyNcclConnector supports layerwise kv transfer
+        return self.kv_connector is not None and self.kv_connector in [
+            "LayerwisePyNcclConnector"
+        ]        
+
+    @property
     def tensor_parallel_multiplier(self) -> int:
         return self.kv_consumers_tensor_parallel_size // self.kv_producers_tensor_parallel_size
 
